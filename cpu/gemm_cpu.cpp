@@ -45,16 +45,59 @@ void gemm_cpu_o0(float* A, float* B, float *C, int M, int N, int K) {
 // Your optimized implementations go here
 // note that for o4 you don't have to change the code, but just the compiler flags. So, you can use o3's code for that part
 void gemm_cpu_o1(float* A, float* B, float *C, int M, int N, int K) {
+  for (int i = 0; i < M; i++) {   // Process one row of A at a time
+    for (int k = 0; k < K; k++) { // Process elements in A row-wise
+      for (int j = 0; j < N; j++) { // Process elements in B column-wise
+        C[i * N + j] += A[i * K + k] * B[k * N + j];
+      }
+    }
+  }
+} 
 
-}
+#define TILE_SIZE 64  
 
 void gemm_cpu_o2(float* A, float* B, float *C, int M, int N, int K) {
+  for (int i = 0; i < M; i += TILE_SIZE) {   
+    for (int k = 0; k < K; k += TILE_SIZE) { 
+      for (int j = 0; j < N; j += TILE_SIZE) { 
 
+        for (int ii = i; ii < i + TILE_SIZE && ii < M; ii++) {
+          for (int kk = k; kk < k + TILE_SIZE && kk < K; kk++) {
+            float a_ik = A[ii * K + kk];  // Load A once into register
+
+            for (int jj = j; jj < j + TILE_SIZE && jj < N; jj++) {
+              C[ii * N + jj] += a_ik * B[kk * N + jj];
+            }
+          }
+        }
+      }
+    }
+  }
 }
+
+#include <omp.h>
 
 void gemm_cpu_o3(float* A, float* B, float *C, int M, int N, int K) {
+  #pragma omp parallel for
+  for (int i = 0; i < M; i += TILE_SIZE) {   
+    for (int k = 0; k < K; k += TILE_SIZE) { 
+      for (int j = 0; j < N; j += TILE_SIZE) { 
 
+        for (int ii = i; ii < (i + TILE_SIZE < M ? i + TILE_SIZE : M); ii++) {
+          for (int kk = k; kk < (k + TILE_SIZE < K ? k + TILE_SIZE : K); kk++) {
+            float a_ik = A[ii * K + kk];
+
+            #pragma omp simd  // Vectorize inner loop
+            for (int jj = j; jj < (j + TILE_SIZE < N ? j + TILE_SIZE : N); jj++) {
+              C[ii * N + jj] += a_ik * B[kk * N + jj];
+            }
+          }
+        }
+      }
+    }
+  }
 }
+
 
 
 int main(int argc, char* argv[]) {
@@ -87,9 +130,9 @@ int main(int argc, char* argv[]) {
 	CHECK(gemm_cpu_o3)
 	delete[] refC;
 	
-	TIME(gemm_cpu_o0)
-	TIME(gemm_cpu_o1)
-	TIME(gemm_cpu_o2)
+	// TIME(gemm_cpu_o0)
+	// TIME(gemm_cpu_o1)
+	// TIME(gemm_cpu_o2)
 	TIME(gemm_cpu_o3)
 
 	delete[] A;
