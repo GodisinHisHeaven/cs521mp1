@@ -103,25 +103,114 @@ void gemm_gpu_o0(float* A, float* B, float* C, int M, int N, int K)
 }
 
 // The scafolding for optimized GEMM implementations
-__global__ void gemm_gpu_o1_kernel(float* A, float* B, float *C, int M, int N, int K) {
-}
-void gemm_gpu_o1(float* A, float* B, float* C, int M, int N, int K)
-{
-	// Init block and grid size
+__global__ void gemm_gpu_o1_kernel(float* A, float* B, float* C, int M, int N, int K) {
+    // Calculate row and column index
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) { 
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += A[row * K + k] * B[k * N + col]; 
+        }
+        C[row * N + col] = sum;
+    }
 }
 
-__global__ void gemm_gpu_o2_kernel(float* A, float* B, float *C, int M, int N, int K) {
-}
-void gemm_gpu_o2(float* A, float* B, float* C, int M, int N, int K)
-{
-	// Init block and grid size
+#define TILE_SIZE 32  // Adjust tile size for performance
+
+void gemm_gpu_o1(float* A, float* B, float* C, int M, int N, int K) {
+    // Define block and grid sizes based on suitable kernel launch parameters
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    
+    // Launch kernel
+    gemm_gpu_o1_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
-__global__ void gemm_gpu_o3_kernel(float* A, float* B, float *C, int M, int N, int K) {
+__global__ void gemm_gpu_o2_kernel(float* A, float* B, float* C, int M, int N, int K) {
+    __shared__ float Asub[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bsub[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Load tiles into shared memory
+        if (row < M && (t * TILE_SIZE + threadIdx.x) < K)
+            Asub[threadIdx.y][threadIdx.x] = A[row * K + t * TILE_SIZE + threadIdx.x];
+        else
+            Asub[threadIdx.y][threadIdx.x] = 0.0f; 
+
+        if (col < N && (t * TILE_SIZE + threadIdx.y) < K)
+            Bsub[threadIdx.y][threadIdx.x] = B[(t * TILE_SIZE + threadIdx.y) * N + col];
+        else
+            Bsub[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();  // Synchronize before computing
+
+        // Compute partial sum
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += Asub[threadIdx.y][k] * Bsub[k][threadIdx.x];
+        }
+
+        __syncthreads();  // Synchronize before loading new tiles
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
 }
+
+void gemm_gpu_o2(float* A, float* B, float* C, int M, int N, int K) {
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+
+    gemm_gpu_o2_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
+}
+
+__global__ void gemm_gpu_o3_kernel(float* A, float* B, float* C, int M, int N, int K) {
+    __shared__ float Asub[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bsub[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Load tiles into shared memory
+        if (row < M && (t * TILE_SIZE + threadIdx.x) < K)
+            Asub[threadIdx.y][threadIdx.x] = A[row * K + t * TILE_SIZE + threadIdx.x];
+        else
+            Asub[threadIdx.y][threadIdx.x] = 0.0f; 
+
+        if (col < N && (t * TILE_SIZE + threadIdx.y) < K)
+            Bsub[threadIdx.y][threadIdx.x] = B[(t * TILE_SIZE + threadIdx.y) * N + col];
+        else
+            Bsub[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();  // Synchronize before computing
+
+        // Compute partial sum
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += Asub[threadIdx.y][k] * Bsub[k][threadIdx.x];
+        }
+
+        __syncthreads();  // Synchronize before loading new tiles
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
+}
+
 void gemm_gpu_o3(float* A, float* B, float* C, int M, int N, int K)
 {
-	// Init block and grid size
+    dim3 blockSize(16, 16);  // Adjust based on profiling
+    dim3 gridSize((N + blockSize.x - 1) / blockSize.x, (M + blockSize.y - 1) / blockSize.y);
+    
+    gemm_gpu_o3_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
 
@@ -148,15 +237,15 @@ int main(int argc, char* argv[]) {
         // Check if implementation is correct
 	auto ref = Ref();
 	float* refC = new float[Ref::M * Ref::N]();
- 	CHECK(gemm_gpu_o0)
-	CHECK(gemm_gpu_o1)
-	CHECK(gemm_gpu_o2)
+ 	// CHECK(gemm_gpu_o0)
+	// CHECK(gemm_gpu_o1)
+	// CHECK(gemm_gpu_o2)
 	CHECK(gemm_gpu_o3)
 
 	// Actual run
- 	TIME(gemm_gpu_o0)
-	TIME(gemm_gpu_o1)
-	TIME(gemm_gpu_o2)
+ 	// TIME(gemm_gpu_o0)
+	// TIME(gemm_gpu_o1)
+	// TIME(gemm_gpu_o2)
 	TIME(gemm_gpu_o3)
 
 	cudaFreeHost(A);
