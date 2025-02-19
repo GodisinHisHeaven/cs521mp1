@@ -1,5 +1,7 @@
 #include "../include/utils.h"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+
 
 #define NUM_RUNS 10
 
@@ -213,6 +215,25 @@ void gemm_gpu_o3(float* A, float* B, float* C, int M, int N, int K)
     gemm_gpu_o3_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
+void gemm_cublas(float* A, float* B, float* C, int M, int N, int K) {
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    // cuBLAS uses column-major storage, so switch row/col order
+    cublasSgemm(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N, 
+                N, M, K,  
+                &alpha,  
+                B, N,  // B is col-major
+                A, K,  // A is col-major
+                &beta,  
+                C, N);  // C is col-major
+
+    cublasDestroy(handle);
+}
+
 
 
 int main(int argc, char* argv[]) {
@@ -241,12 +262,16 @@ int main(int argc, char* argv[]) {
 	// CHECK(gemm_gpu_o1)
 	// CHECK(gemm_gpu_o2)
 	CHECK(gemm_gpu_o3)
+	CHECK(gemm_cublas)
+
 
 	// Actual run
  	// TIME(gemm_gpu_o0)
 	// TIME(gemm_gpu_o1)
 	// TIME(gemm_gpu_o2)
 	TIME(gemm_gpu_o3)
+	TIME(gemm_cublas)
+	
 
 	cudaFreeHost(A);
 	cudaFreeHost(B);
