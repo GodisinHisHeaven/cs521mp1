@@ -1,36 +1,8 @@
 import numpy as np
-import math
-
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
-from neuronxcc.nki import baremetal
 
-
-"""
-A convolution kernel that you need to implement.
-
-Parameters:
-    X: the input tensor
-    W: the weights of the convolution filters.
-    bias: the biases of the convolution filters.
-
-expect: X.shape == [batch_size, in_channels, input_height, input_width]
-expect: W.shape == [out_channels, in_channels, filter_height, filter_width]
-expect: bias.shape == [out_channels]
-expect: filter_height == filter_width
-expect: input_channels % 128 == 0
-expect: output_channels % 128 == 0
-
-out_height = input_height - filter_height + 1
-out_width = input_width - filter_width + 1
-
-out_pool_height = out_height
-out_pool_width = out_width
-
-The shape of the output should be [batch_size, out_channels, out_pool_height, out_pool_width]
-
-"""
 
 @nki.jit
 def conv2d(X, W, bias):
@@ -46,30 +18,131 @@ def conv2d(X, W, bias):
     out_height = input_height - filter_height + 1
     out_width = input_width - filter_width + 1
 
-    out_pool_height = out_height
-    out_pool_width = out_width
-    
-    # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == 0
 
-    # Can assume one PSUM bank can at least fit one row of the pixels
-    assert nl.tile_size.gemm_moving_fmax >= out_width
-
-    # Initialize output array
     X_out = nl.ndarray(
-        shape=(batch_size, out_channels, out_pool_height, out_pool_width),
+        shape=(batch_size, out_channels, out_height, out_width),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
 
-    # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    # Define tiling parameters
+    input_chan_block_size = nl.tile_size.pmax
+    num_input_chan_tiles = in_channels // input_chan_block_size
 
-    # Process the images in batches
+    output_chan_block_size = nl.tile_size.pmax
+    num_output_chan_tiles = out_channels // output_chan_block_size
+
+    output_height_block_size = 2
+    num_output_height_tiles = (
+        out_height + output_height_block_size - 1
+    ) // output_height_block_size
+
+    tile_height = out_height // num_output_height_tiles
+
+    # reshape input and weights
+    X = X.reshape(
+        (
+            batch_size,
+            num_input_chan_tiles,
+            input_chan_block_size,
+            input_height,
+            input_width,
+        )
+    )
+    bias = bias.reshape((num_output_chan_tiles, output_chan_block_size, 1))
+
+    bias_buf = nl.ndarray(
+        (num_output_chan_tiles, nl.par_dim(output_chan_block_size), 1),
+        dtype=bias.dtype,
+        buffer=nl.sbuf,
+    )
+    for j in nl.affine_range(num_output_chan_tiles):
+        bias_buf[j] = nl.load(bias[j])
+
+    W = W.reshape(
+        (
+            num_output_chan_tiles,
+            output_chan_block_size,
+            num_input_chan_tiles,
+            input_chan_block_size,
+            filter_height,
+            filter_width,
+        )
+    )
+    weights = nl.ndarray(
+        (
+            num_output_chan_tiles,
+            nl.par_dim(output_chan_block_size),
+            num_input_chan_tiles,
+            input_chan_block_size,
+            filter_height,
+            filter_width,
+        ),
+        dtype=W.dtype,
+        buffer=nl.sbuf,
+    )
+    for i in nl.affine_range(num_output_chan_tiles):
+        weights[i] = nl.load(W[i])
+
+    # Loop over each batch image
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b and store the result in X_out[b]")
+        for a in nl.affine_range(num_output_height_tiles):
+            img_sbuf = nl.ndarray(
+                (
+                    num_input_chan_tiles,
+                    nl.par_dim(input_chan_block_size),
+                    tile_height + filter_height - 1,
+                    input_width,
+                ),
+                dtype=X.dtype,
+                buffer=nl.sbuf,
+            )
+            for i in nl.affine_range(num_input_chan_tiles):
+                img_sbuf[i] = nl.load(
+                    X[
+                        b,
+                        i,
+                        :,
+                        a * tile_height : (a + 1) * tile_height + filter_height - 1,
+                        :,
+                    ]
+                )
+
+            for i in nl.affine_range(num_output_chan_tiles):
+                curr_output = nl.ndarray(
+                    (nl.par_dim(output_chan_block_size), tile_height, out_width),
+                    dtype=X.dtype,
+                    buffer=nl.sbuf,
+                )
+
+                for curr_row in nl.affine_range(tile_height):
+                    accum = nl.zeros(
+                        (output_chan_block_size, out_width),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
+                    )
+                    # Accumulate partial sums
+                    for fh in nl.affine_range(filter_height):
+                        for fw in nl.affine_range(filter_width):
+                            for j in nl.affine_range(num_input_chan_tiles):
+                                accum += nl.matmul(
+                                    weights[i, :, j, :, fh, fw],
+                                    img_sbuf[j, :, curr_row + fh, fw : fw + out_width],
+                                    transpose_x=False,
+                                )
+                    # Add bias
+                    accum = nisa.tensor_scalar(accum, nl.add, bias_buf[i])
+                    curr_output[:, curr_row, :] = nl.copy(accum)
+
+                nl.store(
+                    X_out[
+                        b,
+                        i * output_chan_block_size : (i + 1) * output_chan_block_size,
+                        a * tile_height : (a + 1) * tile_height,
+                        :,
+                    ],
+                    value=curr_output[...],
+                )
 
     return X_out
-
