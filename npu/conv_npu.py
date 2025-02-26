@@ -9,9 +9,22 @@ def conv2d(X, W, bias):
 
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
+    out_channels_ = bias.shape[0]
+
+    assert (
+        in_channels_ == in_channels and out_channels_ == out_channels
+    ), f"Shape mismatch. {in_channels}, {in_channels_}, {out_channels}, {out_channels_}"
+
+    assert in_channels == in_channels_
+
+    # Can assume multiple of 128 to avoid using mask
+    assert in_channels % 128 == 0
 
     out_height = input_height - filter_height + 1
     out_width = input_width - filter_width + 1
+
+    # Can assume one PSUM bank can at least fit one row of the pixels
+    assert nl.tile_size.gemm_moving_fmax >= out_width
 
     X_out = nl.ndarray(
         shape=(batch_size, out_channels, out_height, out_width),
@@ -26,10 +39,9 @@ def conv2d(X, W, bias):
     output_chan_block_size = input_chan_block_size
     num_output_chan_tiles = out_channels // output_chan_block_size
 
-    output_height_block_size = 2
     num_output_height_tiles = (
-        out_height + output_height_block_size - 1
-    ) // output_height_block_size
+        out_height + 1
+    ) // 2  # +1 to ensure we have at least one tile
 
     tile_height = out_height // num_output_height_tiles
 
